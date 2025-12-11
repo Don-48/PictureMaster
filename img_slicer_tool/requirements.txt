@@ -1,0 +1,13 @@
+# GUI
+PySide6==6.7.2
+
+# Image processing
+Pillow==10.2.0
+pyvips==2.2.1
+numpy==1.26.4
+
+# Packaging
+pyinstaller==6.3.0
+
+# Logging (optional but recommended)
+loguru==0.7.2
