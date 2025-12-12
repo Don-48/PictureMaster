@@ -3,15 +3,24 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QFileDialog, QInputDialog, QMainWindow, QMessageBox
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QAction, QDesktopServices
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QHBoxLayout,
+    QInputDialog,
+    QMainWindow,
+    QMessageBox,
+    QWidget,
+)
 
 from models.image_document import ImageDocument
+from models.slice_layout import SliceLayout
 from services.crop_service import crop_document_to_new_image
 from services.image_loader import load_image_document
 from services.slice_service import slice_document_to_tiles
 from views.image_view import ImageView
-from views.overlay_items import GuideLineItem
+from views.slice_side_panel import SliceSidePanel
 
 
 class MainWindow(QMainWindow):
@@ -21,9 +30,20 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
 
         self._image_view = ImageView(self)
-        self.setCentralWidget(self._image_view)
+        self._slice_panel = SliceSidePanel(self)
+        central_widget = QWidget(self)
+        central_layout = QHBoxLayout(central_widget)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self._slice_panel)
+        central_layout.addWidget(self._image_view, 1)
+        self.setCentralWidget(central_widget)
+        self._slice_panel.setVisible(False)
+        self._slice_panel.set_slice_mode(self._image_view.sliceMode)
+        self._slice_panel.set_line_tool(self._image_view.lineTool)
         self._current_document: Optional[ImageDocument] = None
         self._slice_output_root: Optional[str] = None
+        self._last_manual_tool = "cross"
 
         self._create_actions()
         self._create_menus()
@@ -68,10 +88,16 @@ class MainWindow(QMainWindow):
         self._open_action.triggered.connect(self.open_image_dialog)
         self._exit_action.triggered.connect(self.close)
         self._image_view.cropRequested.connect(self._on_crop_requested)
+        self._image_view.imageDropped.connect(self._on_image_dropped)
+        self._image_view.invalidFileDropped.connect(self._on_invalid_drop)
         self._toggle_slice_mode_action.toggled.connect(self._on_toggle_slice_mode)
         self._generate_grid_action.triggered.connect(self._on_generate_grid_from_rows_cols)
         self._execute_slice_action.triggered.connect(self._on_execute_slice)
         self._set_slice_output_dir_action.triggered.connect(self._on_set_slice_output_dir)
+        self._slice_panel.sliceModeChanged.connect(self._on_slice_work_mode_changed)
+        self._slice_panel.gridValueChanged.connect(self._on_grid_values_changed)
+        self._slice_panel.lineToolChanged.connect(self._on_line_tool_changed)
+        self._slice_panel.executeRequested.connect(self._on_execute_slice)
 
     def open_image_dialog(self) -> None:
         dialog = QFileDialog(self)
@@ -168,12 +194,11 @@ class MainWindow(QMainWindow):
     def _on_toggle_slice_mode(self, enabled: bool) -> None:
         if enabled:
             self._image_view.set_mode(self._image_view.MODE_SLICE)
-            self.statusBar().showMessage(
-                "已进入切图模式：点击生成切图线（默认十字线，Shift=横线，Ctrl=竖线）",
-                5000,
-            )
+            self._slice_panel.setVisible(True)
+            self.statusBar().showMessage("已进入切图模式：使用左侧工作栏配置切图方式和工具。", 6000)
         else:
             self._image_view.set_mode(self._image_view.MODE_CROP)
+            self._slice_panel.setVisible(False)
             self.statusBar().showMessage("已退出切图模式，回到裁剪模式", 5000)
 
     def _on_set_slice_output_dir(self) -> None:
@@ -187,11 +212,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先打开一张图片。")
             return
 
-        pixmap_rect = self._image_view.get_pixmap_rect()
-        if pixmap_rect is None:
-            QMessageBox.warning(self, "提示", "未找到预览图，无法生成宫格线。")
-            return
-
         rows, ok_rows = QInputDialog.getInt(self, "输入行数", "切图行数（>=1）：", 2, 1, 100)
         if not ok_rows:
             return
@@ -200,18 +220,12 @@ class MainWindow(QMainWindow):
         if not ok_cols:
             return
 
-        h_step = pixmap_rect.height() / rows
-        v_step = pixmap_rect.width() / cols
-
-        for i in range(1, rows):
-            y = pixmap_rect.top() + h_step * i
-            self._image_view.add_slice_line(GuideLineItem.HORIZONTAL, y)
-
-        for j in range(1, cols):
-            x = pixmap_rect.left() + v_step * j
-            self._image_view.add_slice_line(GuideLineItem.VERTICAL, x)
-
-        self.statusBar().showMessage(f"已生成 {rows}x{cols} 宫格切图线（不含边界线）。", 5000)
+        self._ensure_slice_mode_enabled()
+        self._slice_panel.set_slice_mode("grid")
+        self._image_view.set_slice_work_mode("grid")
+        self._slice_panel.set_grid_values(rows, cols)
+        self._image_view.set_grid_size(rows, cols)
+        self.statusBar().showMessage(f"已生成 {rows}x{cols} 宫格切图线。", 5000)
 
     def _on_execute_slice(self) -> None:
         if self._current_document is None:
@@ -220,6 +234,7 @@ class MainWindow(QMainWindow):
 
         doc = self._current_document
         layout = self._image_view.get_slice_layout()
+        tile_count = self._calculate_tile_count(layout)
 
         if not layout.horizontal_lines and not layout.vertical_lines:
             reply = QMessageBox.question(
@@ -243,5 +258,106 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "切图失败", f"切图过程中发生错误：\n{exc}")
             return
 
-        QMessageBox.information(self, "切图完成", f"切图已完成，保存于目录：\n{output_dir}")
-        self.statusBar().showMessage(f"切图完成：{output_dir}", 8000)
+        self._show_slice_result(output_dir, tile_count)
+
+    def _on_slice_work_mode_changed(self, mode: str) -> None:
+        if mode not in {"grid", "manual"}:
+            return
+        if (
+            mode == "manual"
+            and self._image_view.sliceMode == "grid"
+            and self._image_view.has_cut_lines()
+        ):
+            reply = QMessageBox.question(
+                self,
+                "切换模式",
+                "切换到手动模式将清除当前网格线，是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                self._slice_panel.set_slice_mode("grid")
+                return
+
+        self._image_view.set_slice_work_mode(mode)
+        if mode == "manual":
+            self._image_view.set_line_tool(self._last_manual_tool)
+            self._slice_panel.set_line_tool(self._last_manual_tool)
+        else:
+            self._slice_panel.set_line_tool("select")
+
+    def _on_grid_values_changed(self, rows: int, cols: int) -> None:
+        if self._current_document is None or self._image_view.sliceMode != "grid":
+            return
+        self._image_view.set_grid_size(rows, cols)
+        self.statusBar().showMessage(f"网格模式：{rows} 行 x {cols} 列。", 4000)
+
+    def _on_line_tool_changed(self, tool: str) -> None:
+        self._image_view.set_line_tool(tool)
+        if tool != "select":
+            self._last_manual_tool = tool
+        if self._image_view.sliceMode != "manual":
+            return
+        hints = {
+            "horizontal": "左键点击生成水平切割线。",
+            "vertical": "左键点击生成垂直切割线。",
+            "cross": "左键点击生成十字切割线。",
+            "select": "左键点击选中切割线。",
+        }
+        message = hints.get(tool)
+        if message:
+            self.statusBar().showMessage(f"手动模式：{message}", 5000)
+
+    def _on_image_dropped(self, path: str) -> None:
+        self.load_image(path)
+
+    def _on_invalid_drop(self, path: str) -> None:
+        QMessageBox.warning(
+            self,
+            "不支持的文件",
+            f"仅支持拖拽 jpg/png/jpeg/webp 图片文件。\n无法加载：{os.path.basename(path)}",
+        )
+
+    def _ensure_slice_mode_enabled(self) -> None:
+        if not self._toggle_slice_mode_action.isChecked():
+            self._toggle_slice_mode_action.setChecked(True)
+
+    def _calculate_tile_count(self, layout: SliceLayout) -> int:
+        pixmap_rect = self._image_view.get_pixmap_rect()
+        if pixmap_rect is None:
+            return 0
+        xs, ys = layout.get_boundaries(int(pixmap_rect.width()), int(pixmap_rect.height()))
+        count = 0
+        for row in range(len(ys) - 1):
+            if ys[row + 1] <= ys[row]:
+                continue
+            for col in range(len(xs) - 1):
+                if xs[col + 1] <= xs[col]:
+                    continue
+                count += 1
+        if count == 0 and xs and ys:
+            count = max(1, len(xs) - 1) * max(1, len(ys) - 1)
+        return max(count, 1)
+
+    def _show_slice_result(self, output_dir: str, tile_count: int) -> None:
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("切图完成")
+        msg_box.setText(f"切图完成，共生成 {tile_count} 个切片。")
+        msg_box.setInformativeText(f"输出目录：\n{output_dir}")
+        open_btn = msg_box.addButton("打开输出文件夹", QMessageBox.ActionRole)
+        ok_btn = msg_box.addButton("确定", QMessageBox.AcceptRole)
+        msg_box.setDefaultButton(ok_btn)
+        msg_box.exec()
+
+        if msg_box.clickedButton() is open_btn:
+            self._open_directory(output_dir)
+
+        self.statusBar().showMessage(
+            f"切图完成（{tile_count} 个切片）：{output_dir}",
+            8000,
+        )
+
+    def _open_directory(self, directory: str) -> None:
+        if not directory:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(directory))

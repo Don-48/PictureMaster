@@ -25,7 +25,7 @@ class CropRectItem(QGraphicsRectItem):
 
 
 class GuideLineItem(QGraphicsLineItem):
-    """红色虚线切图线，可移动、可选中。"""
+    """切图线条，支持高亮显示。"""
 
     HORIZONTAL = "horizontal"
     VERTICAL = "vertical"
@@ -36,14 +36,21 @@ class GuideLineItem(QGraphicsLineItem):
             raise ValueError("orientation must be 'horizontal' or 'vertical'")
         self.orientation = orientation
 
-        pen = QPen(Qt.red)
-        pen.setStyle(Qt.DashLine)
-        pen.setWidth(1)
+        self._apply_pen(highlighted=False)
+        self.setZValue(9)
+        # 自定义高亮方案，因此禁用场景级的选中/拖动行为。
+        self.setFlag(QGraphicsLineItem.ItemIsMovable, False)
+        self.setFlag(QGraphicsLineItem.ItemIsSelectable, False)
+
+    def _apply_pen(self, highlighted: bool) -> None:
+        pen = QPen(QColor(255, 170, 0) if highlighted else QColor(255, 0, 0))
+        pen.setWidth(3 if highlighted else 1)
+        pen.setStyle(Qt.SolidLine if highlighted else Qt.DashLine)
         self.setPen(pen)
 
-        self.setZValue(9)
-        self.setFlag(QGraphicsLineItem.ItemIsMovable, True)
-        self.setFlag(QGraphicsLineItem.ItemIsSelectable, True)
+    def set_highlighted(self, highlighted: bool) -> None:
+        """切换线条高亮效果。"""
+        self._apply_pen(highlighted)
 
     def scene_coordinate_value(self) -> float:
         """返回线条在场景中的关键坐标。"""
